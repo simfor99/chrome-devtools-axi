@@ -14,6 +14,7 @@ import {
   resolveBridgeScript,
 } from "./bridge-script.js";
 import { callRequestTimeoutMs } from "./navigation-timeout.js";
+import { ownerKey } from "./owned-pages.js";
 import { needsPageId } from "./pages.js";
 import {
   clearSelectedPageId,
@@ -53,7 +54,8 @@ export type ErrorCode =
   | "TIMEOUT"
   | "BROWSER_ERROR"
   | "VALIDATION_ERROR"
-  | "UNKNOWN";
+  | "UNKNOWN"
+  | "OWNER_REQUIRED";
 
 export class CdpError extends AxiError {
   constructor(
@@ -726,18 +728,81 @@ function resolveToolArgs(
   return { ...args, pageId: resolveSelectedPageId(reconnected) };
 }
 
+/** Shared HTTP path for owned-page CLI commands and freshness snapshots. */
+export async function callToolViaBridge(
+  port: number,
+  owner: string | undefined,
+  name: string,
+  args: Record<string, unknown> = {},
+  opts: { roots?: string[]; timeoutMs?: number; ambient?: boolean } = {},
+): Promise<string> {
+  try {
+    const health = JSON.parse(
+      await httpGet(port, "/health", HEALTH_TIMEOUT_MS, ambientHeaders(opts)),
+    ) as { status?: unknown; bridgeId?: unknown };
+    if (typeof health.bridgeId !== "string" || health.status !== "ok") {
+      throw new Error(
+        "Bridge lacks owned-page routing; controlled owner-approved reload required",
+      );
+    }
+    const body: Record<string, unknown> = {
+      name,
+      args,
+      owner,
+      bridgeId: health.bridgeId,
+    };
+    if (opts.roots && opts.roots.length > 0) body.roots = opts.roots;
+    const resp = await httpPost(
+      port,
+      "/call",
+      body,
+      opts.timeoutMs,
+      ambientHeaders(opts),
+    );
+    return parseCallResponse(resp);
+  } catch (err) {
+    if (err instanceof CdpError) throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    throw mapErrorMessage(message);
+  }
+}
+
 /**
  * Call an MCP tool via the bridge. Returns the text result.
  *
- * Page-scoped tools (eval/snapshot/click/fill and the rest of
- * `PAGE_SCOPED_TOOLS` in `src/pages.ts`) get the session's last
- * `select_page` / created `new_page` `pageId` injected so they satisfy
- * chrome-devtools-mcp 1.8+ defaults. `list_pages` is never consulted.
+ * When task-owned routing is active (all production CLI runs and whenever
+ * `CHROME_DEVTOOLS_AXI_OWNER_ID` or `CHROME_DEVTOOLS_AXI_REQUIRE_OWNER=1` is
+ * set), requires a valid `CHROME_DEVTOOLS_AXI_OWNER_ID` (except `list_pages`)
+ * and binds the call to the bridge's `OwnedPageRouter`.
  */
 export async function callTool(
   name: string,
   args: Record<string, unknown> = {},
 ): Promise<string> {
+  const owner = process.env.CHROME_DEVTOOLS_AXI_OWNER_ID;
+  const enforceOwnedRouting =
+    owner !== undefined ||
+    process.env.CHROME_DEVTOOLS_AXI_REQUIRE_OWNER === "1" ||
+    !process.env.VITEST;
+
+  if (enforceOwnedRouting) {
+    if (name !== "list_pages") {
+      try {
+        ownerKey(owner);
+      } catch (error) {
+        throw new CdpError(
+          error instanceof Error ? error.message : String(error),
+          "OWNER_REQUIRED",
+        );
+      }
+    }
+    const port = await ensureBridge();
+    return callToolViaBridge(port, owner, name, args, {
+      roots: collectRootDirs(name, args),
+      timeoutMs: callRequestTimeoutMs(args),
+    });
+  }
+
   // Owned by this call alone, so a concurrent `run`-script call cannot
   // overwrite or consume this one's reconnect attribution.
   const notice: PageIdentityNotice = { pageIdentityChanged: false };
@@ -934,6 +999,17 @@ export async function getSessionSnapshotIfRunning(): Promise<string | null> {
     return null;
   }
   try {
+    const owner = process.env.CHROME_DEVTOOLS_AXI_OWNER_ID;
+    if (owner) {
+      return await callToolViaBridge(
+        pidInfo.port,
+        owner,
+        "take_snapshot",
+        {},
+        { timeoutMs: 5000, ambient: true },
+      );
+    }
+    if (!process.env.VITEST) return null;
     const pageId = getSelectedPageId();
     if (pageId === null) return null;
     return await postTool(

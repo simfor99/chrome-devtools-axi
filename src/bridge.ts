@@ -64,11 +64,22 @@ import {
   type IdleTracker,
 } from "./idle.js";
 import { clearSelectedPageId } from "./selected-page.js";
+import { OwnedPageRouter } from "./owned-pages.js";
 import {
   resolveSessionName,
   resolveSessionPidFile,
   resolveSessionPort,
 } from "./sessions.js";
+
+const routers = new WeakMap<BridgeClient, OwnedPageRouter>();
+export function routerFor(client: BridgeClient): OwnedPageRouter {
+  let router = routers.get(client);
+  if (!router) {
+    router = new OwnedPageRouter(client);
+    routers.set(client, router);
+  }
+  return router;
+}
 
 // Re-exported so existing bridge consumers keep a single import surface; the
 // definitions live in the MCP-free ./bridge-script.js (see its header).
@@ -86,6 +97,8 @@ export interface BridgeContentBlock {
 export interface BridgeCallPayload {
   name: string;
   args: Record<string, unknown>;
+  owner?: string;
+  bridgeId?: string;
   /**
    * Absolute directories the caller wants added to the MCP workspace roots for
    * this call, so file-writing tools may write there. See
@@ -95,9 +108,15 @@ export interface BridgeCallPayload {
   roots?: string[];
 }
 
-interface BridgeToolDescription {
+export interface BridgeToolDescription {
   name: string;
   description?: string;
+  inputSchema?: {
+    type: string;
+    properties?: Record<string, unknown>;
+    required?: string[];
+  };
+  annotations?: Record<string, unknown>;
 }
 
 export interface BridgeClient {
@@ -393,12 +412,20 @@ function hasStructuredReconnectMarker(result: unknown): boolean {
 }
 
 export function parseBridgeCallPayload(body: string): BridgeCallPayload {
-  let payload: { name?: unknown; args?: unknown; roots?: unknown };
+  let payload: {
+    name?: unknown;
+    args?: unknown;
+    roots?: unknown;
+    owner?: unknown;
+    bridgeId?: unknown;
+  };
   try {
     payload = JSON.parse(body) as {
       name?: unknown;
       args?: unknown;
       roots?: unknown;
+      owner?: unknown;
+      bridgeId?: unknown;
     };
   } catch {
     throw new Error("Invalid bridge request payload");
@@ -407,8 +434,19 @@ export function parseBridgeCallPayload(body: string): BridgeCallPayload {
     throw new Error("Invalid bridge request payload");
   }
   const roots = parseRootsField(payload.roots);
+  const ownerFields = {
+    ...(payload.owner !== undefined ? { owner: payload.owner as string } : {}),
+    ...(payload.bridgeId !== undefined
+      ? { bridgeId: payload.bridgeId as string }
+      : {}),
+  };
   if (payload.args === undefined) {
-    return { name: payload.name, args: {}, ...(roots ? { roots } : {}) };
+    return {
+      name: payload.name,
+      args: {},
+      ...ownerFields,
+      ...(roots ? { roots } : {}),
+    };
   }
   if (
     payload.args === null ||
@@ -420,6 +458,7 @@ export function parseBridgeCallPayload(body: string): BridgeCallPayload {
   return {
     name: payload.name,
     args: payload.args as Record<string, unknown>,
+    ...ownerFields,
     ...(roots ? { roots } : {}),
   };
 }
@@ -469,6 +508,12 @@ async function handleToolsRequest(
     result.tools.map((tool) => ({
       name: tool.name,
       description: tool.description,
+      ...(tool.inputSchema !== undefined
+        ? { inputSchema: tool.inputSchema }
+        : {}),
+      ...(tool.annotations !== undefined
+        ? { annotations: tool.annotations }
+        : {}),
     })),
   );
 }
@@ -481,6 +526,11 @@ async function handleCallRequest(
 ): Promise<void> {
   const body = await readRequestBody(req);
   const payload = parseBridgeCallPayload(body);
+  if (payload.owner !== undefined || payload.bridgeId !== undefined) {
+    const result = await routerFor(client).run(payload);
+    writeJson(res, 200, { result: extractToolText(getToolContent(result)) });
+    return;
+  }
   const result = await client.callTool(
     {
       name: payload.name,
@@ -491,26 +541,11 @@ async function handleCallRequest(
   const text = extractToolText(getToolContent(result));
   const pageIdentityChanged = didMcpPageIdentityChange(result, text);
   if (pageIdentityChanged) onPageIdentityChanged?.();
-  // The reconnect that reissued every page id happened *during* this call, so
-  // an explicit `pageId` in the request was resolved against the new id space:
-  // the content may belong to another tab, and upstream's own failure text
-  // ("No page found", because page ids come from a monotonic counter) names a
-  // missing page instead of the reconnect that caused it. Report the identity
-  // boundary either way, ahead of the tool-error branch, so the caller
-  // re-selects rather than hunting for a closed tab. Only a call that named no
-  // page - `list_pages`, `new_page` - targeted no particular tab and is left
-  // alone. The home view probe is NOT one of those: it always sends the
-  // persisted `pageId`, so after a reconnect it takes this branch, `postTool`
-  // throws, and `getSessionSnapshotIfRunning` degrades to no page. That
-  // degradation is intentional - rendering a snapshot resolved in a reissued
-  // id space is exactly the silent retarget this branch exists to prevent.
   if (pageIdentityChanged && typeof payload.args.pageId === "number") {
     writeJson(res, 200, { error: PAGE_IDENTITY_CHANGED_ERROR });
     return;
   }
   if (isToolResultError(result)) {
-    // Surface the tool's own failure text as an error so the CLI throws and
-    // exits non-zero instead of printing success (issue #96).
     writeJson(res, 200, { error: text || `Tool "${payload.name}" failed` });
     return;
   }
@@ -524,6 +559,7 @@ export async function handleBridgeRequest(
   sessionName?: string,
   logForbidden?: (message: string) => void,
   onPageIdentityChanged?: () => boolean | void,
+  includeBridgeId = false,
 ): Promise<void> {
   res.setHeader("Content-Type", "application/json");
 
@@ -577,6 +613,7 @@ export async function handleBridgeRequest(
       writeJson(res, 200, {
         status: "ok",
         session: sessionName,
+        ...(includeBridgeId ? { bridgeId: routerFor(client).bridgeId } : {}),
         ...(droppedSelection ? { pageIdentityChanged: true } : {}),
       });
       return;
@@ -622,6 +659,7 @@ export function createBridgeServer(
       sessionName,
       logBridgeMessage,
       clearSelectedPageId,
+      true,
     );
   });
 }

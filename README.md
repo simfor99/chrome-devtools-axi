@@ -483,6 +483,18 @@ State is stored in `~/.chrome-devtools-axi/` (named sessions nest under `session
 | `bridge.pid`          | PID and port of the running bridge    |
 | `snapshot-generation` | Counter used to detect stale uid refs |
 
+### Strict Multi-Caller Page Ownership (`CHROME_DEVTOOLS_AXI_OWNER_ID`)
+
+In multi-agent environments sharing one Chrome bridge (`127.0.0.1:9224`), every caller must identify itself via `CHROME_DEVTOOLS_AXI_OWNER_ID` (matching `/^[A-Za-z0-9._:-]{1,128}$/`):
+
+```sh
+export CHROME_DEVTOOLS_AXI_OWNER_ID="agent-session-1"
+chrome-devtools-axi newpage https://example.com --background
+```
+
+- **Fail-closed tab ownership (`OwnedPageRouter`):** Each caller tracks its own `ownedPageIds` and `selectedPageId` in the bridge. A caller can only select, inspect, interact with, or close tabs it created via `newpage --background`, never foreign or user tabs (`FOREIGN_PAGE` / `NO_OWNED_PAGE_SELECTED`).
+- **Attached persistent Chrome vs. isolated headless Chrome (`shouldUseSharedDefaultContext`):** When attached to an existing persistent browser via `CHROME_DEVTOOLS_AXI_BROWSER_URL`, `CHROME_DEVTOOLS_AXI_AUTO_CONNECT`, or `CHROME_DEVTOOLS_AXI_USER_DATA_DIR` (or `CHROME_DEVTOOLS_AXI_ISOLATED_CONTEXT=0`), `newpage --background` opens background tabs inside the default browser profile so existing cookies and logins stay active without spawning a second incognito window. In standalone headless mode (or with `CHROME_DEVTOOLS_AXI_ISOLATED_CONTEXT=1`), each caller additionally receives an isolated browser context (`axi-owned-<uuid>`).
+
 ### Navigation timeout
 
 chrome-devtools-mcp gives a navigation 10 seconds by default, so a heavy page can fail with `Navigation timeout of 10000 ms exceeded`. Opt into a longer wait with `--timeout <ms>` on `open` or `newpage`, or set a default once:

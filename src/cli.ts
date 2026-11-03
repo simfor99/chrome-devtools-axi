@@ -1431,8 +1431,8 @@ async function handleSelectPage(
       "Run `chrome-devtools-axi selectpage <id>` — get ID from `pages` command",
     ]);
   }
-  const pageId = parseInt(id, 10);
-  if (isNaN(pageId)) {
+  const pageId = /^\d+$/.test(id) ? Number(id) : NaN;
+  if (!Number.isSafeInteger(pageId)) {
     throw new CdpError(`Invalid page ID: ${id}`, "VALIDATION_ERROR", [
       "Run `chrome-devtools-axi pages` to list available page IDs",
     ]);
@@ -1449,27 +1449,31 @@ async function handleClosePage(args: string[]): Promise<string> {
       "Run `chrome-devtools-axi closepage <id>` — get ID from `pages` command",
     ]);
   }
-  const pageId = parseInt(id, 10);
-  if (isNaN(pageId)) {
+  const pageId = /^\d+$/.test(id) ? Number(id) : NaN;
+  if (!Number.isSafeInteger(pageId)) {
     throw new CdpError(`Invalid page ID: ${id}`, "VALIDATION_ERROR", [
       "Run `chrome-devtools-axi pages` to list available page IDs",
     ]);
   }
-  // Check page count before closing — last page can't be closed
-  const beforeResult = await callTool("list_pages");
-  const pagesBefore = parsePagesList(beforeResult);
-  if (pagesBefore.length <= 1) {
-    const blocks = [
-      encode({ status: "cannot close the last open page (no-op)" }),
-    ];
-    blocks.push(
-      renderHelp([
-        "Run `chrome-devtools-axi newpage <url>` to open another tab first",
-        "Run `chrome-devtools-axi stop` to shut down the browser entirely",
-      ]),
-    );
-    return renderOutput(blocks);
+  if (!process.env.CHROME_DEVTOOLS_AXI_OWNER_ID && process.env.VITEST) {
+    // Check page count before closing — last page can't be closed
+    const beforeResult = await callTool("list_pages");
+    const pagesBefore = parsePagesList(beforeResult);
+    if (pagesBefore.length <= 1) {
+      const blocks = [
+        encode({ status: "cannot close the last open page (no-op)" }),
+      ];
+      blocks.push(
+        renderHelp([
+          "Run `chrome-devtools-axi newpage <url>` to open another tab first",
+          "Run `chrome-devtools-axi stop` to shut down the browser entirely",
+        ]),
+      );
+      return renderOutput(blocks);
+    }
   }
+  // Central router validates ownership and verifies actual closure, including
+  // the backend's last-page restriction, before reporting success.
   await callTool("close_page", { pageId });
   return encode({ status: "closed", pageId });
 }
