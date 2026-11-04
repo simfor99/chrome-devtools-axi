@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
-import { describe, it } from "vitest";
+import { afterEach, beforeEach, describe, it, vi } from "vitest";
 import {
   createBridgeServer,
   type BridgeClient,
@@ -136,6 +136,24 @@ function fixture() {
 }
 
 describe("OwnedPageRouter", () => {
+  beforeEach(() => {
+    for (const key of [
+      "CHROME_DEVTOOLS_AXI_BROWSER_URL",
+      "CHROME_DEVTOOLS_AXI_AUTO_CONNECT",
+      "CHROME_DEVTOOLS_AXI_USER_DATA_DIR",
+      "CHROME_DEVTOOLS_AXI_ISOLATED_CONTEXT",
+      "CHROME_DEVTOOLS_AXI_OWNER_ID",
+      "CHROME_DEVTOOLS_AXI_REQUIRE_OWNER",
+    ]) {
+      vi.stubEnv(key, "");
+      delete process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("Actual inputSchema routes arbitrary future tools, snapshot/eval and ID zero; caller args untouched", async () => {
     const f = fixture();
     await f.create(ownerA);
@@ -438,6 +456,60 @@ describe("OwnedPageRouter", () => {
       } else {
         process.env.CHROME_DEVTOOLS_AXI_REQUIRE_OWNER = priorReq;
       }
+    }
+  });
+
+  it("Failed new_page in shared default context does not claim a concurrently opened user tab for cleanup", async () => {
+    vi.stubEnv("CHROME_DEVTOOLS_AXI_BROWSER_URL", "http://127.0.0.1:9222");
+    const f = fixture();
+    let listCalls = 0;
+    const origCallTool = f.client.callTool.bind(f.client);
+    f.client.callTool = async (req, roots) => {
+      if (req.name === "list_pages") {
+        listCalls += 1;
+        if (listCalls === 2) {
+          // Simulate user opening tab 77 in default context while new_page failed
+          f.pages.set(77, { id: 77, url: "https://user.example", selected: true });
+        }
+      }
+      if (req.name === "new_page") {
+        throw new Error("Simulated new_page failure without creating an owned tab");
+      }
+      return origCallTool(req, roots);
+    };
+    await assert.rejects(
+      f.create(ownerA),
+      /New page identity ambiguous; no ownership granted/,
+    );
+    await assert.rejects(
+      f.call("close_page", { pageId: 77 }, ownerA),
+      /Page belongs to another task or was not created by this caller/,
+    );
+  });
+
+  it("Bridge enforces OwnedPageRouter on unowned /call when CHROME_DEVTOOLS_AXI_REQUIRE_OWNER=1", async () => {
+    vi.stubEnv("CHROME_DEVTOOLS_AXI_REQUIRE_OWNER", "1");
+    const f = fixture();
+    const server = createBridgeServer(f.client);
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const unownedCall = await fetch(`http://127.0.0.1:${port}/call`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: "take_snapshot",
+          args: { pageId: 99 },
+        }),
+      });
+      assert.equal(unownedCall.status, 500);
+      const body = (await unownedCall.json()) as { error?: string };
+      assert.match(
+        String(body.error),
+        /Stale or unbound bridge instance|CHROME_DEVTOOLS_AXI_OWNER_ID/,
+      );
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 });

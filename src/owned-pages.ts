@@ -12,7 +12,11 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { BridgeCallPayload, BridgeClient } from "./bridge.js";
+import type {
+  BridgeCallPayload,
+  BridgeClient,
+  BridgeToolDescription,
+} from "./bridge.js";
 
 interface McpContentBlock {
   type?: string;
@@ -157,15 +161,68 @@ export function ownerKey(owner: unknown): string {
 
 export class OwnedPageRouter {
   readonly bridgeId: string = randomUUID();
+  requireOwnedRouting = false;
   private readonly owners = new Map<string, OwnerContext>();
-  private queue: Promise<unknown> = Promise.resolve();
+  private readonly ownerQueues = new Map<string, Promise<unknown>>();
+  private exclusiveChain: Promise<unknown> = Promise.resolve();
+  private exclusivePending = 0;
+  private readonly activeShared = new Set<Promise<unknown>>();
+  private cachedTools: BridgeToolDescription[] | null = null;
 
   constructor(private readonly client: BridgeClient) {}
 
   run(payload: BridgeCallPayload): Promise<unknown> {
-    const pending = this.queue.then(() => this.call(payload));
-    this.queue = pending.catch(() => {});
-    return pending;
+    const isExclusive =
+      payload.name === "new_page" ||
+      payload.name === "close_page" ||
+      typeof payload.owner !== "string";
+    if (isExclusive) {
+      this.exclusivePending += 1;
+      const prevEx = this.exclusiveChain;
+      const task = (async () => {
+        try {
+          await prevEx;
+          while (this.activeShared.size > 0) {
+            await Promise.allSettled([...this.activeShared]);
+          }
+          return await this.call(payload);
+        } finally {
+          this.exclusivePending -= 1;
+        }
+      })();
+      this.exclusiveChain = task.then(
+        () => {},
+        () => {},
+      );
+      return task;
+    }
+    const key = payload.owner as string;
+    const prevOwner = this.ownerQueues.get(key) ?? Promise.resolve();
+    const task = (async () => {
+      await prevOwner;
+      while (this.exclusivePending > 0) {
+        await this.exclusiveChain;
+      }
+      const p = this.call(payload);
+      const settled = p.then(
+        () => {},
+        () => {},
+      );
+      this.activeShared.add(settled);
+      try {
+        return await p;
+      } finally {
+        this.activeShared.delete(settled);
+      }
+    })();
+    this.ownerQueues.set(
+      key,
+      task.then(
+        () => {},
+        () => {},
+      ),
+    );
+    return task;
   }
 
   private async call({
@@ -176,10 +233,20 @@ export class OwnedPageRouter {
     roots,
   }: BridgeCallPayload): Promise<unknown> {
     if (bridgeId !== this.bridgeId) {
-      throw new Error("Stale or unbound bridge instance");
+      throw new Error(
+        bridgeId === undefined
+          ? "Stale or unbound bridge instance (bridge is in owned-page mode; set CHROME_DEVTOOLS_AXI_OWNER_ID)"
+          : "Stale or unbound bridge instance",
+      );
     }
-    const tools = (await this.client.listTools()).tools;
-    const tool = tools.find((t) => t.name === name);
+    if (!this.cachedTools) {
+      this.cachedTools = (await this.client.listTools()).tools;
+    }
+    let tool = this.cachedTools.find((t) => t.name === name);
+    if (!tool) {
+      this.cachedTools = (await this.client.listTools()).tools;
+      tool = this.cachedTools.find((t) => t.name === name);
+    }
     if (!tool?.inputSchema?.properties) {
       throw new Error("Tool inputSchema unavailable");
     }
@@ -253,18 +320,33 @@ export class OwnedPageRouter {
       } catch (error) {
         creationError = error;
       }
+      const alreadyTracked = (id: number): boolean =>
+        context.pages.has(id) || context.cleanupPages.has(id);
       const listing = asToolResult(
         await this.client.callTool({ name: "list_pages", arguments: {} }),
       );
       if (listing.isError) {
+        if (!creationError && !asToolResult(result).isError) {
+          try {
+            const rep = [...pageIds(result)].filter(
+              (id) => !before.has(id) && !alreadyTracked(id),
+            );
+            if (
+              rep.length === 1 &&
+              inOwnedContext(result, rep[0], context.isolatedContext)
+            ) {
+              context.cleanupPages.add(rep[0]);
+            }
+          } catch {
+            // Ignore malformed result when post-creation listing also failed.
+          }
+        }
         throw new Error(
           "Post-creation page listing failed; no ownership granted",
         );
       }
       const after = pageIds(listing);
       const newlyListed = [...after].filter((id) => !before.has(id));
-      const alreadyTracked = (id: number): boolean =>
-        context.pages.has(id) || context.cleanupPages.has(id);
       let created: number[] = [];
       let reported = new Set<number>();
       const resObj = asToolResult(result);
@@ -285,7 +367,9 @@ export class OwnedPageRouter {
         if (
           newlyListed.length === 1 &&
           !alreadyTracked(newlyListed[0]) &&
-          inOwnedContext(listing, newlyListed[0], context.isolatedContext)
+          inOwnedContext(listing, newlyListed[0], context.isolatedContext) &&
+          (context.isolatedContext !== undefined ||
+            reported.has(newlyListed[0]))
         ) {
           const id = newlyListed[0];
           context.cleanupPages.add(id);
@@ -331,9 +415,11 @@ export class OwnedPageRouter {
     const listing = asToolResult(
       await this.client.callTool({ name: "list_pages", arguments: {} }),
     );
-    if (cleanupOnly && listing.isError) {
+    if (listing.isError) {
       throw new Error(
-        "Cleanup page listing failed; ownership retained for cleanup",
+        cleanupOnly
+          ? "Cleanup page listing failed; ownership retained for cleanup"
+          : "Page listing failed; ownership retained",
       );
     }
     const live = pageIds(listing);
@@ -353,7 +439,7 @@ export class OwnedPageRouter {
       roots,
     );
     if (asToolResult(result).isError) {
-      throw new Error("Page tool returned an error; result not accepted");
+      return result;
     }
     if (name === "select_page") context.selected = id;
     if (name === "close_page") {

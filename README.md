@@ -485,15 +485,16 @@ State is stored in `~/.chrome-devtools-axi/` (named sessions nest under `session
 
 ### Strict Multi-Caller Page Ownership (`CHROME_DEVTOOLS_AXI_OWNER_ID`)
 
-In multi-agent environments sharing one Chrome bridge (`127.0.0.1:9224`), every caller must identify itself via `CHROME_DEVTOOLS_AXI_OWNER_ID` (matching `/^[A-Za-z0-9._:-]{1,128}$/`):
+In multi-agent environments sharing one Chrome bridge (`127.0.0.1:9224`), enable strict ownership (`CHROME_DEVTOOLS_AXI_REQUIRE_OWNER=1`) and identify each caller via `CHROME_DEVTOOLS_AXI_OWNER_ID` (matching `/^[A-Za-z0-9._:-]{8,200}$/`):
 
 ```sh
+export CHROME_DEVTOOLS_AXI_REQUIRE_OWNER=1
 export CHROME_DEVTOOLS_AXI_OWNER_ID="agent-session-1"
 chrome-devtools-axi newpage https://example.com --background
 ```
 
-- **Fail-closed tab ownership (`OwnedPageRouter`):** Each caller tracks its own `ownedPageIds` and `selectedPageId` in the bridge. A caller can only select, inspect, interact with, or close tabs it created via `newpage --background`, never foreign or user tabs (`FOREIGN_PAGE` / `NO_OWNED_PAGE_SELECTED`).
-- **Attached persistent Chrome vs. isolated headless Chrome (`shouldUseSharedDefaultContext`):** When attached to an existing persistent browser via `CHROME_DEVTOOLS_AXI_BROWSER_URL`, `CHROME_DEVTOOLS_AXI_AUTO_CONNECT`, or `CHROME_DEVTOOLS_AXI_USER_DATA_DIR` (or `CHROME_DEVTOOLS_AXI_ISOLATED_CONTEXT=0`), `newpage --background` opens background tabs inside the default browser profile so existing cookies and logins stay active without spawning a second incognito window. In standalone headless mode (or with `CHROME_DEVTOOLS_AXI_ISOLATED_CONTEXT=1`), each caller additionally receives an isolated browser context (`axi-owned-<uuid>`).
+- **Cooperative multi-caller tab isolation (`OwnedPageRouter`):** Each caller tracks its own `ownedPageIds` and `selectedPageId` in the bridge. Missing or malformed caller IDs are rejected with `OWNER_REQUIRED`. Once `CHROME_DEVTOOLS_AXI_REQUIRE_OWNER=1` is set on the bridge or the first owned caller binds to the bridge, every page-scoped tool call must pass through `OwnedPageRouter`, allowing a caller to select, inspect, interact with, or close only tabs it created via `newpage --background` (`"Page belongs to another task or was not created by this caller"` / `"Missing or invalid explicit owned page ID"`, surfaced by the client as `BROWSER_ERROR` or `UNKNOWN`). Note that this is cooperative task isolation rather than a cryptographic security boundary: `list_pages` (`pages`) still lists all open tabs, and `CHROME_DEVTOOLS_AXI_OWNER_ID` is a caller-declared identifier.
+- **Persistent profile vs. isolated context (`shouldUseSharedDefaultContext`):** When attached via `CHROME_DEVTOOLS_AXI_BROWSER_URL` or `CHROME_DEVTOOLS_AXI_AUTO_CONNECT=1`, when launched with a persistent `CHROME_DEVTOOLS_AXI_USER_DATA_DIR`, or with `CHROME_DEVTOOLS_AXI_ISOLATED_CONTEXT=0`, `newpage --background` opens background tabs inside the default browser profile so existing cookies and logins stay active. In the default `--isolated` mode (or with `CHROME_DEVTOOLS_AXI_ISOLATED_CONTEXT=1`), each caller additionally receives an isolated browser context (`axi-owned-<uuid>`).
 
 ### Navigation timeout
 

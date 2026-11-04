@@ -5,6 +5,7 @@ import {
   callTool,
   ensureBridge,
   getSessionSnapshotIfRunning,
+  isOwnedRoutingEnforced,
   stopBridge,
 } from "./client.js";
 import { getCurrentGeneration } from "./generation.js";
@@ -1455,7 +1456,7 @@ async function handleClosePage(args: string[]): Promise<string> {
       "Run `chrome-devtools-axi pages` to list available page IDs",
     ]);
   }
-  if (!process.env.CHROME_DEVTOOLS_AXI_OWNER_ID && process.env.VITEST) {
+  if (!isOwnedRoutingEnforced()) {
     // Check page count before closing — last page can't be closed
     const beforeResult = await callTool("list_pages");
     const pagesBefore = parsePagesList(beforeResult);

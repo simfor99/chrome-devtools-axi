@@ -433,11 +433,17 @@ export function parseBridgeCallPayload(body: string): BridgeCallPayload {
   if (typeof payload.name !== "string" || payload.name.length === 0) {
     throw new Error("Invalid bridge request payload");
   }
+  if (payload.owner !== undefined && typeof payload.owner !== "string") {
+    throw new Error("Invalid bridge request payload");
+  }
+  if (payload.bridgeId !== undefined && typeof payload.bridgeId !== "string") {
+    throw new Error("Invalid bridge request payload");
+  }
   const roots = parseRootsField(payload.roots);
   const ownerFields = {
-    ...(payload.owner !== undefined ? { owner: payload.owner as string } : {}),
-    ...(payload.bridgeId !== undefined
-      ? { bridgeId: payload.bridgeId as string }
+    ...(typeof payload.owner === "string" ? { owner: payload.owner } : {}),
+    ...(typeof payload.bridgeId === "string"
+      ? { bridgeId: payload.bridgeId }
       : {}),
   };
   if (payload.args === undefined) {
@@ -526,9 +532,23 @@ async function handleCallRequest(
 ): Promise<void> {
   const body = await readRequestBody(req);
   const payload = parseBridgeCallPayload(body);
-  if (payload.owner !== undefined || payload.bridgeId !== undefined) {
-    const result = await routerFor(client).run(payload);
-    writeJson(res, 200, { result: extractToolText(getToolContent(result)) });
+  const router = routerFor(client);
+  if (
+    process.env.CHROME_DEVTOOLS_AXI_REQUIRE_OWNER === "1" ||
+    process.env.CHROME_DEVTOOLS_AXI_OWNER_ID !== undefined ||
+    typeof payload.owner === "string" ||
+    typeof payload.bridgeId === "string"
+  ) {
+    router.requireOwnedRouting = true;
+  }
+  if (router.requireOwnedRouting) {
+    const result = await router.run(payload);
+    const text = extractToolText(getToolContent(result));
+    if (isToolResultError(result)) {
+      writeJson(res, 200, { error: text || `Tool "${payload.name}" failed` });
+      return;
+    }
+    writeJson(res, 200, { result: text });
     return;
   }
   const result = await client.callTool(

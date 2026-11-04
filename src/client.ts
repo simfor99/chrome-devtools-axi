@@ -740,9 +740,16 @@ export async function callToolViaBridge(
     const health = JSON.parse(
       await httpGet(port, "/health", HEALTH_TIMEOUT_MS, ambientHeaders(opts)),
     ) as { status?: unknown; bridgeId?: unknown };
-    if (typeof health.bridgeId !== "string" || health.status !== "ok") {
-      throw new Error(
-        "Bridge lacks owned-page routing; controlled owner-approved reload required",
+    if (health.status !== "ok") {
+      throw new CdpError("Bridge health check failed", "BRIDGE_NOT_READY", [
+        "Run `chrome-devtools-axi stop`, then retry the command",
+      ]);
+    }
+    if (typeof health.bridgeId !== "string") {
+      throw new CdpError(
+        "Running bridge lacks owned-page routing (started by an older version)",
+        "BRIDGE_NOT_READY",
+        ["Run `chrome-devtools-axi stop`, then retry the command"],
       );
     }
     const body: Record<string, unknown> = {
@@ -767,23 +774,29 @@ export async function callToolViaBridge(
   }
 }
 
+export function isOwnedRoutingEnforced(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    env.CHROME_DEVTOOLS_AXI_OWNER_ID !== undefined ||
+    env.CHROME_DEVTOOLS_AXI_REQUIRE_OWNER === "1"
+  );
+}
+
 /**
  * Call an MCP tool via the bridge. Returns the text result.
  *
- * When task-owned routing is active (all production CLI runs and whenever
- * `CHROME_DEVTOOLS_AXI_OWNER_ID` or `CHROME_DEVTOOLS_AXI_REQUIRE_OWNER=1` is
- * set), requires a valid `CHROME_DEVTOOLS_AXI_OWNER_ID` (except `list_pages`)
- * and binds the call to the bridge's `OwnedPageRouter`.
+ * When task-owned routing is active (`CHROME_DEVTOOLS_AXI_OWNER_ID` is set or
+ * `CHROME_DEVTOOLS_AXI_REQUIRE_OWNER=1` is enabled), requires a valid
+ * `CHROME_DEVTOOLS_AXI_OWNER_ID` (except `list_pages`) and binds the call to
+ * the bridge's `OwnedPageRouter`.
  */
 export async function callTool(
   name: string,
   args: Record<string, unknown> = {},
 ): Promise<string> {
   const owner = process.env.CHROME_DEVTOOLS_AXI_OWNER_ID;
-  const enforceOwnedRouting =
-    owner !== undefined ||
-    process.env.CHROME_DEVTOOLS_AXI_REQUIRE_OWNER === "1" ||
-    !process.env.VITEST;
+  const enforceOwnedRouting = isOwnedRoutingEnforced();
 
   if (enforceOwnedRouting) {
     if (name !== "list_pages") {
@@ -1000,7 +1013,7 @@ export async function getSessionSnapshotIfRunning(): Promise<string | null> {
   }
   try {
     const owner = process.env.CHROME_DEVTOOLS_AXI_OWNER_ID;
-    if (owner) {
+    if (owner !== undefined) {
       return await callToolViaBridge(
         pidInfo.port,
         owner,
@@ -1009,7 +1022,7 @@ export async function getSessionSnapshotIfRunning(): Promise<string | null> {
         { timeoutMs: 5000, ambient: true },
       );
     }
-    if (!process.env.VITEST) return null;
+    if (process.env.CHROME_DEVTOOLS_AXI_REQUIRE_OWNER === "1") return null;
     const pageId = getSelectedPageId();
     if (pageId === null) return null;
     return await postTool(
