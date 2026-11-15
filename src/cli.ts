@@ -98,6 +98,13 @@ environment:
                                     run at once without colliding. Connection mode and profile are
                                     unchanged. Defaults to "default" (port 9224, legacy state paths).
                                     e.g. CHROME_DEVTOOLS_AXI_SESSION=worker-1
+  CHROME_DEVTOOLS_AXI_OWNER_ID      Explicit task identity for owned tabs, e.g. herdr-workspace-task.
+                                    Set before page actions; keep it stable through closepage.
+                                    SESSION isolates bridges; OWNER_ID isolates tab ownership.
+  CHROME_DEVTOOLS_AXI_ISOLATED_CONTEXT
+                                    Set to 1 to force a separate context without existing logins.
+                                    With BROWSER_URL, AUTO_CONNECT, or USER_DATA_DIR, owned new
+                                    tabs otherwise reuse the connected default profile context.
   CHROME_DEVTOOLS_AXI_BROWSER_URL   Connect to an existing Chrome instance instead of launching one.
                                     http(s):// uses --browserUrl (fetches /json/version).
                                     ws(s):// uses --wsEndpoint (direct WebSocket).
@@ -130,6 +137,25 @@ environment:
                                     Opt-in: a bridge started with this set stops itself after
                                     this many ms with no commands (min: 1000). Unset or 0: the
                                     bridge runs until 'stop' (default).
+
+authenticated_browser_workflow:
+  For an already signed-in site, use the configured existing browser connection.
+  A newly launched isolated browser does not inherit the user's login. A sign-in
+  screen there is not evidence that the model lacks browser tools.
+  Set a task-specific CHROME_DEVTOOLS_AXI_SESSION before the first browser call.
+  Connection variables apply when that session's bridge starts. Changing
+  BROWSER_URL alone does not retarget an already running bridge. Use a new named
+  session for another connection; do not stop another task's shared bridge.
+  1. Read the configured CDP endpoint/shared MCP service; never guess a port.
+     Do not print credentials or config headers. Set BROWSER_URL for direct CDP
+     attachment (or use the configured MCP_SERVER_URL service).
+  2. Set CHROME_DEVTOOLS_AXI_OWNER_ID to a unique task identity; run pages.
+  3. newpage <url> --background; selectpage <owned-id>; snapshot.
+     Verify the visible account. Never select or modify someone else's tab.
+  4. Use fresh snapshot refs for click/fillform; wait for page changes.
+     Reload and read back persisted state before reporting a mutation as done.
+  5. closepage <owned-id> when finished. Do not stop a shared browser.
+  A named SESSION is not a login profile. Consult <command> --help for syntax.
 
 gpu:
   Headless Chrome cannot access hardware GPU on most Linux systems.
