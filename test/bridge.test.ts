@@ -19,6 +19,7 @@ import {
   createBridgeServer,
   createRootsAwareBridgeClient,
   createTransport,
+  detectCompatibleChromiumExecutable,
   detectGlobalMcpPath,
   didMcpPageIdentityChange,
   extractHostHeaderHostname,
@@ -33,10 +34,15 @@ import {
   isBridgeClientConnected,
   isBridgeTargetReachable,
   isIdleActivity,
+  listPlaywrightChromiumCandidates,
+  MIN_CDP_COMPATIBLE_CHROME_MAJOR,
   PAGE_IDENTITY_CHANGED_ERROR,
   parseBridgeCallPayload,
+  parseChromeMajorVersion,
+  probeChromeMajorVersion,
   removePidFile,
   resolveBridgeScript,
+  resolvePlaywrightBrowsersRoot,
   resolveTransport,
   resolveTransportSpec,
   type BridgeClient,
@@ -939,6 +945,276 @@ process.stdout.write(JSON.stringify(resolveTransportSpec()));`,
     const spec = resolveTransportSpec(probe);
     expect(spec.command).toBe(process.execPath);
     expect(spec.args[0]).toBe("/explicit/override.js");
+  });
+
+  describe("CDP-compatible Chromium fallback", () => {
+    let savedExecPath: string | undefined;
+    let savedChannel: string | undefined;
+
+    beforeEach(() => {
+      savedExecPath = process.env.CHROME_DEVTOOLS_AXI_EXECUTABLE_PATH;
+      savedChannel = process.env.CHROME_DEVTOOLS_AXI_CHANNEL;
+      delete process.env.CHROME_DEVTOOLS_AXI_EXECUTABLE_PATH;
+      delete process.env.CHROME_DEVTOOLS_AXI_CHANNEL;
+    });
+
+    afterEach(() => {
+      if (savedExecPath === undefined) {
+        delete process.env.CHROME_DEVTOOLS_AXI_EXECUTABLE_PATH;
+      } else {
+        process.env.CHROME_DEVTOOLS_AXI_EXECUTABLE_PATH = savedExecPath;
+      }
+      if (savedChannel === undefined) {
+        delete process.env.CHROME_DEVTOOLS_AXI_CHANNEL;
+      } else {
+        process.env.CHROME_DEVTOOLS_AXI_CHANNEL = savedChannel;
+      }
+    });
+
+    it("parses Chrome and Chromium major version strings", () => {
+      expect(parseChromeMajorVersion("Google Chrome 146.0.7680.71\n")).toBe(
+        146,
+      );
+      expect(
+        parseChromeMajorVersion("Google Chrome for Testing 153.0.8010.12\n"),
+      ).toBe(153);
+      expect(parseChromeMajorVersion("Chromium 148.0.1.2")).toBe(148);
+      expect(parseChromeMajorVersion("unknown")).toBeNull();
+    });
+
+    it("selects Playwright Chromium >= 147 when default system Chrome is 146", () => {
+      const selected = detectCompatibleChromiumExecutable({
+        findDefaultSystemChrome: () => "/usr/bin/google-chrome",
+        getChromeMajorVersion: (bin) => {
+          if (bin === "/usr/bin/google-chrome") return 146;
+          if (bin.includes("chromium-1243")) return 153;
+          if (bin.includes("chromium-1208")) return 145;
+          return null;
+        },
+        listPlaywrightChromiumCandidates: () => [
+          "/cache/chromium-1243/chrome-linux64/chrome",
+          "/cache/chromium-1208/chrome-linux64/chrome",
+        ],
+      });
+      expect(selected).toBe("/cache/chromium-1243/chrome-linux64/chrome");
+    });
+
+    it("keeps system Chrome untouched when its major version is already compatible", () => {
+      const listCandidates = vi.fn(() => [
+        "/cache/chromium-1243/chrome-linux64/chrome",
+      ]);
+      const selected = detectCompatibleChromiumExecutable({
+        findDefaultSystemChrome: () => "/usr/bin/google-chrome",
+        getChromeMajorVersion: () => MIN_CDP_COMPATIBLE_CHROME_MAJOR,
+        listPlaywrightChromiumCandidates: listCandidates,
+      });
+      expect(selected).toBeNull();
+      expect(listCandidates).not.toHaveBeenCalled();
+    });
+
+    it("returns null without probing cache when no default system Chrome binary is found", () => {
+      const listCandidates = vi.fn(() => [
+        "/cache/chromium-1243/chrome-linux64/chrome",
+      ]);
+      const selected = detectCompatibleChromiumExecutable({
+        findDefaultSystemChrome: () => null,
+        getChromeMajorVersion: vi.fn(() => 153),
+        listPlaywrightChromiumCandidates: listCandidates,
+      });
+      expect(selected).toBeNull();
+      expect(listCandidates).not.toHaveBeenCalled();
+    });
+
+    it("returns null without probing cache when default system Chrome version cannot be measured", () => {
+      const listCandidates = vi.fn(() => [
+        "/cache/chromium-1243/chrome-linux64/chrome",
+      ]);
+      const selected = detectCompatibleChromiumExecutable({
+        findDefaultSystemChrome: () => "/usr/bin/google-chrome",
+        getChromeMajorVersion: () => null,
+        listPlaywrightChromiumCandidates: listCandidates,
+      });
+      expect(selected).toBeNull();
+      expect(listCandidates).not.toHaveBeenCalled();
+    });
+
+    it("returns null gracefully when only incompatible Playwright builds exist", () => {
+      const selected = detectCompatibleChromiumExecutable({
+        findDefaultSystemChrome: () => "/usr/bin/google-chrome",
+        getChromeMajorVersion: () => 145,
+        listPlaywrightChromiumCandidates: () => [
+          "/cache/chromium-1208/chrome-linux64/chrome",
+        ],
+      });
+      expect(selected).toBeNull();
+    });
+
+    it.skipIf(process.platform === "win32")(
+      "probes real executable --version output and returns null on non-zero exit",
+      () => {
+        const root = mkdtempSync(join(tmpdir(), "probe-chrome-ver-"));
+        try {
+          const okBin = join(root, "fake-chrome-ok");
+          writeFileSync(
+            okBin,
+            '#!/bin/sh\necho "Google Chrome for Testing 153.0.8010.12"\n',
+            { mode: 0o755 },
+          );
+          const failBin = join(root, "fake-chrome-fail");
+          writeFileSync(failBin, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+          expect(probeChromeMajorVersion(okBin)).toBe(153);
+          expect(probeChromeMajorVersion(failBin)).toBeNull();
+          expect(
+            probeChromeMajorVersion(join(root, "missing-chrome")),
+          ).toBeNull();
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+    );
+
+    it("reads Windows Chrome version from sibling version entries without spawning chrome.exe", () => {
+      const root = mkdtempSync(join(tmpdir(), "probe-win-chrome-ver-"));
+      try {
+        const fakeExe = join(root, "chrome.exe");
+        writeFileSync(fakeExe, "not-executed", { mode: 0o644 });
+        expect(probeChromeMajorVersion(fakeExe, "win32")).toBeNull();
+        writeFileSync(join(root, "146.0.7680.71.manifest"), "<assembly/>");
+        expect(probeChromeMajorVersion(fakeExe, "win32")).toBe(146);
+        mkdirSync(join(root, "153.0.8010.12"));
+        expect(probeChromeMajorVersion(fakeExe, "win32")).toBe(153);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("sorts Playwright chromium-* revisions numerically descending across all platform layouts and ignores headless shells", () => {
+      const root = mkdtempSync(join(tmpdir(), "pw-chromium-cache-"));
+      try {
+        for (const [rev, rel] of [
+          ["chromium-999", join("chrome-win64", "chrome.exe")],
+          ["chromium-1100", join("chrome-linux-arm64", "chrome")],
+          [
+            "chromium-1208",
+            join(
+              "chrome-mac-x64",
+              "Google Chrome for Testing.app",
+              "Contents",
+              "MacOS",
+              "Google Chrome for Testing",
+            ),
+          ],
+          ["chromium-1243", join("chrome-linux64", "chrome")],
+          ["chromium_headless_shell-9999", join("chrome-linux64", "chrome")],
+        ] as const) {
+          const full = join(root, rev, rel);
+          mkdirSync(join(full, ".."), { recursive: true });
+          writeFileSync(full, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        }
+        const candidates = listPlaywrightChromiumCandidates(root);
+        expect(candidates).toEqual([
+          join(root, "chromium-1243", "chrome-linux64", "chrome"),
+          join(
+            root,
+            "chromium-1208",
+            "chrome-mac-x64",
+            "Google Chrome for Testing.app",
+            "Contents",
+            "MacOS",
+            "Google Chrome for Testing",
+          ),
+          join(root, "chromium-1100", "chrome-linux-arm64", "chrome"),
+          join(root, "chromium-999", "chrome-win64", "chrome.exe"),
+        ]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("resolves Playwright browser cache root honoring PLAYWRIGHT_BROWSERS_PATH and XDG_CACHE_HOME", () => {
+      expect(
+        resolvePlaywrightBrowsersRoot(
+          { PLAYWRIGHT_BROWSERS_PATH: "/custom/pw" },
+          "linux",
+          "/home/u",
+        ),
+      ).toBe("/custom/pw");
+      expect(
+        resolvePlaywrightBrowsersRoot(
+          { PLAYWRIGHT_BROWSERS_PATH: "0", XDG_CACHE_HOME: "/xdg-cache" },
+          "linux",
+          "/home/u",
+        ),
+      ).toBe(join("/xdg-cache", "ms-playwright"));
+      expect(
+        resolvePlaywrightBrowsersRoot(
+          { PLAYWRIGHT_BROWSERS_PATH: "0" },
+          "linux",
+          "/home/u",
+        ),
+      ).toBe(join("/home/u", ".cache", "ms-playwright"));
+      expect(resolvePlaywrightBrowsersRoot({}, "darwin", "/Users/u")).toBe(
+        join("/Users/u", "Library", "Caches", "ms-playwright"),
+      );
+    });
+
+    it("appends fallback --executablePath only in isolated launch mode and skips probe on userDataDir, explicit overrides, or attach modes", () => {
+      const detectCompatibleChromium = vi.fn(
+        () => "/cache/chromium-1243/chrome-linux64/chrome",
+      );
+      const baseProbe = {
+        existsSync: () => false,
+        getNpmPrefix: () => "/usr",
+        detectCompatibleChromium,
+      };
+
+      const launchSpec = resolveTransportSpec(baseProbe);
+      expect(launchSpec.args).toContain("--isolated");
+      expect(launchSpec.args).toContain(
+        "--executablePath=/cache/chromium-1243/chrome-linux64/chrome",
+      );
+      expect(detectCompatibleChromium).toHaveBeenCalledTimes(1);
+
+      detectCompatibleChromium.mockClear();
+      process.env.CHROME_DEVTOOLS_AXI_USER_DATA_DIR = "/persistent/profile";
+      const profileSpec = resolveTransportSpec(baseProbe);
+      expect(profileSpec.args).toContain("--userDataDir=/persistent/profile");
+      expect(
+        profileSpec.args.some((a) => a.startsWith("--executablePath=")),
+      ).toBe(false);
+      expect(detectCompatibleChromium).not.toHaveBeenCalled();
+
+      delete process.env.CHROME_DEVTOOLS_AXI_USER_DATA_DIR;
+      process.env.CHROME_DEVTOOLS_AXI_EXECUTABLE_PATH = "/explicit/chrome";
+      const explicitSpec = resolveTransportSpec(baseProbe);
+      expect(explicitSpec.args).toContain("--executablePath=/explicit/chrome");
+      expect(detectCompatibleChromium).not.toHaveBeenCalled();
+
+      delete process.env.CHROME_DEVTOOLS_AXI_EXECUTABLE_PATH;
+      process.env.CHROME_DEVTOOLS_AXI_CHANNEL = "beta";
+      const channelSpec = resolveTransportSpec(baseProbe);
+      expect(channelSpec.args).toContain("--channel=beta");
+      expect(
+        channelSpec.args.some((a) => a.startsWith("--executablePath=")),
+      ).toBe(false);
+      expect(detectCompatibleChromium).not.toHaveBeenCalled();
+
+      delete process.env.CHROME_DEVTOOLS_AXI_CHANNEL;
+      process.env.CHROME_DEVTOOLS_AXI_BROWSER_URL = "http://127.0.0.1:9222";
+      const attachSpec = resolveTransportSpec(baseProbe);
+      expect(
+        attachSpec.args.some((a) => a.startsWith("--executablePath=")),
+      ).toBe(false);
+      expect(detectCompatibleChromium).not.toHaveBeenCalled();
+
+      delete process.env.CHROME_DEVTOOLS_AXI_BROWSER_URL;
+      process.env.CHROME_DEVTOOLS_AXI_AUTO_CONNECT = "1";
+      const autoSpec = resolveTransportSpec(baseProbe);
+      expect(autoSpec.args.some((a) => a.startsWith("--executablePath="))).toBe(
+        false,
+      );
+      expect(detectCompatibleChromium).not.toHaveBeenCalled();
+    });
   });
 });
 
