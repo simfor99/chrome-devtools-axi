@@ -36,11 +36,13 @@ import {
   constants as fsConstants,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import {
   basename,
   delimiter,
@@ -743,15 +745,274 @@ export const KEYCHAIN_ISOLATION_CHROME_ARGS = [
   "--password-store=basic",
 ] as const;
 
-export function buildTransportArgs(): string[] {
+/**
+ * Minimum Chromium major version known to support chrome-devtools-mcp@1.13+'s
+ * `Network.emulateNetworkConditionsByRule` call without a mandatory
+ * `params.offline` field. Chrome 146 rejects `emulate` calls when
+ * `networkConditions` is omitted, breaking viewport and color-scheme emulation.
+ */
+export const MIN_CDP_COMPATIBLE_CHROME_MAJOR = 147;
+
+const CHROME_VERSION_RE = /(?:Chrome|Chromium)[^0-9]*(\d+)\./i;
+const SYSTEM_CHROME_PATH_BINARIES = [
+  "google-chrome",
+  "google-chrome-stable",
+] as const;
+const PLAYWRIGHT_CHROMIUM_DIR_RE = /^chromium-(\d+)$/;
+const PLAYWRIGHT_CHROMIUM_BIN_RELPATHS = [
+  join("chrome-linux64", "chrome"),
+  join("chrome-linux-arm64", "chrome"),
+  join("chrome-linux", "chrome"),
+  join(
+    "chrome-mac-arm64",
+    "Google Chrome for Testing.app",
+    "Contents",
+    "MacOS",
+    "Google Chrome for Testing",
+  ),
+  join(
+    "chrome-mac-x64",
+    "Google Chrome for Testing.app",
+    "Contents",
+    "MacOS",
+    "Google Chrome for Testing",
+  ),
+  join(
+    "chrome-mac",
+    "Google Chrome for Testing.app",
+    "Contents",
+    "MacOS",
+    "Google Chrome for Testing",
+  ),
+  join("chrome-win64", "chrome.exe"),
+  join("chrome-win", "chrome.exe"),
+] as const;
+
+export function parseChromeMajorVersion(versionOutput: string): number | null {
+  const match = CHROME_VERSION_RE.exec(versionOutput);
+  if (!match) return null;
+  const major = Number.parseInt(match[1], 10);
+  return Number.isFinite(major) && major > 0 ? major : null;
+}
+
+function isExecutableFile(filePath: string): boolean {
+  try {
+    if (!statSync(filePath).isFile()) return false;
+    accessSync(
+      filePath,
+      process.platform === "win32" ? fsConstants.F_OK : fsConstants.X_OK,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resolvePlaywrightBrowsersRoot(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  home: string = homedir(),
+): string {
+  const override = env.PLAYWRIGHT_BROWSERS_PATH?.trim();
+  if (override && override !== "0") {
+    return override;
+  }
+  if (platform === "darwin") {
+    return join(home, "Library", "Caches", "ms-playwright");
+  }
+  if (platform === "win32") {
+    return join(
+      env.LOCALAPPDATA?.trim() || join(home, "AppData", "Local"),
+      "ms-playwright",
+    );
+  }
+  const xdgCache = env.XDG_CACHE_HOME?.trim();
+  return join(xdgCache || join(home, ".cache"), "ms-playwright");
+}
+
+function findDefaultSystemChromeExecutable(
+  findOnPath: (name: string) => string | null = (name) =>
+    findExecutableOnPath(name),
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  if (platform === "darwin") {
+    const macApp =
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    if (isExecutableFile(macApp)) return macApp;
+  } else if (platform === "win32") {
+    for (const root of [
+      env.PROGRAMFILES,
+      env["PROGRAMFILES(X86)"],
+      env.LOCALAPPDATA,
+    ]) {
+      const trimmed = root?.trim();
+      if (!trimmed) continue;
+      const winExe = join(
+        trimmed,
+        "Google",
+        "Chrome",
+        "Application",
+        "chrome.exe",
+      );
+      if (isExecutableFile(winExe)) return winExe;
+    }
+  } else {
+    for (const fixed of [
+      "/opt/google/chrome/chrome",
+      "/usr/bin/google-chrome",
+      "/usr/bin/google-chrome-stable",
+    ]) {
+      if (isExecutableFile(fixed)) return fixed;
+    }
+  }
+  for (const name of SYSTEM_CHROME_PATH_BINARIES) {
+    const found = findOnPath(name);
+    if (found) return found;
+  }
+  return null;
+}
+
+export function listPlaywrightChromiumCandidates(
+  cacheRoot: string = resolvePlaywrightBrowsersRoot(),
+): string[] {
+  let entries: string[];
+  try {
+    entries = readdirSync(cacheRoot);
+  } catch {
+    return [];
+  }
+  const revisions: Array<{ dir: string; rev: number }> = [];
+  for (const entry of entries) {
+    const match = PLAYWRIGHT_CHROMIUM_DIR_RE.exec(entry);
+    if (!match) continue;
+    const rev = Number.parseInt(match[1], 10);
+    if (Number.isFinite(rev)) {
+      revisions.push({ dir: entry, rev });
+    }
+  }
+  revisions.sort((a, b) => b.rev - a.rev);
+
+  const candidates: string[] = [];
+  for (const { dir } of revisions) {
+    for (const rel of PLAYWRIGHT_CHROMIUM_BIN_RELPATHS) {
+      const full = join(cacheRoot, dir, rel);
+      if (isExecutableFile(full)) {
+        candidates.push(full);
+        break;
+      }
+    }
+  }
+  return candidates;
+}
+
+const WINDOWS_VERSION_ENTRY_RE = /^(\d+)\.\d+\.\d+\.\d+(?:\.manifest)?$/i;
+
+function probeWindowsChromeMajorVersion(executablePath: string): number | null {
+  let entries: string[];
+  try {
+    entries = readdirSync(dirname(executablePath));
+  } catch {
+    return null;
+  }
+  let highest: number | null = null;
+  for (const entry of entries) {
+    const match = WINDOWS_VERSION_ENTRY_RE.exec(entry);
+    if (!match) continue;
+    const major = Number.parseInt(match[1], 10);
+    if (Number.isFinite(major) && major > 0) {
+      highest = highest === null ? major : Math.max(highest, major);
+    }
+  }
+  return highest;
+}
+
+export function probeChromeMajorVersion(
+  executablePath: string,
+  platform: NodeJS.Platform = process.platform,
+): number | null {
+  if (platform === "win32") {
+    return probeWindowsChromeMajorVersion(executablePath);
+  }
+  try {
+    const out = execFileSync(executablePath, ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 3_000,
+      killSignal: "SIGKILL",
+    });
+    return parseChromeMajorVersion(out);
+  } catch {
+    return null;
+  }
+}
+
+export interface ChromiumCompatProbe {
+  findDefaultSystemChrome: () => string | null;
+  getChromeMajorVersion: (executablePath: string) => number | null;
+  listPlaywrightChromiumCandidates: () => string[];
+}
+
+const DEFAULT_CHROMIUM_COMPAT_PROBE: ChromiumCompatProbe = {
+  findDefaultSystemChrome: () => findDefaultSystemChromeExecutable(),
+  getChromeMajorVersion: (executablePath) =>
+    probeChromeMajorVersion(executablePath),
+  listPlaywrightChromiumCandidates: () => listPlaywrightChromiumCandidates(),
+};
+
+/**
+ * Return a local Playwright-cached Chromium executable (`>= 147`) ONLY when
+ * the host's default Chrome stable binary is actually found AND its measured
+ * major version is strictly below {@link MIN_CDP_COMPATIBLE_CHROME_MAJOR}.
+ * Returns `null` when no default system Chrome is found, when its version
+ * cannot be measured, when it is already compatible, or when no newer local
+ * Playwright Chromium build exists.
+ */
+export function detectCompatibleChromiumExecutable(
+  probe: ChromiumCompatProbe = DEFAULT_CHROMIUM_COMPAT_PROBE,
+): string | null {
+  const systemBin = probe.findDefaultSystemChrome();
+  if (!systemBin) {
+    return null;
+  }
+  const systemMajor = probe.getChromeMajorVersion(systemBin);
+  if (systemMajor === null || systemMajor >= MIN_CDP_COMPATIBLE_CHROME_MAJOR) {
+    return null;
+  }
+  for (const candidate of probe.listPlaywrightChromiumCandidates()) {
+    const major = probe.getChromeMajorVersion(candidate);
+    if (major !== null && major >= MIN_CDP_COMPATIBLE_CHROME_MAJOR) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+export interface BuildTransportArgsOptions {
+  /**
+   * Auto-detected Chromium fallback passed by {@link resolveTransportSpec}
+   * when launching an isolated local browser without explicit executablePath,
+   * channel, or userDataDir.
+   */
+  defaultExecutablePath?: string | null;
+}
+
+export function buildTransportArgs(
+  options: BuildTransportArgsOptions = {},
+): string[] {
   const args = ["-y", "chrome-devtools-mcp@latest"];
 
   const autoConnect = process.env.CHROME_DEVTOOLS_AXI_AUTO_CONNECT === "1";
   const browserUrl = process.env.CHROME_DEVTOOLS_AXI_BROWSER_URL;
-  const userDataDir = process.env.CHROME_DEVTOOLS_AXI_USER_DATA_DIR;
+  const userDataDir = process.env.CHROME_DEVTOOLS_AXI_USER_DATA_DIR?.trim();
   const channel = process.env.CHROME_DEVTOOLS_AXI_CHANNEL?.trim();
-  const executablePath =
+  const explicitExecutablePath =
     process.env.CHROME_DEVTOOLS_AXI_EXECUTABLE_PATH?.trim();
+  const fallbackExecutablePath =
+    !explicitExecutablePath && !channel && !userDataDir
+      ? options.defaultExecutablePath?.trim()
+      : undefined;
+  const executablePath = explicitExecutablePath || fallbackExecutablePath;
   const launchesExecutablePath = Boolean(
     executablePath && !autoConnect && !browserUrl,
   );
@@ -852,6 +1113,12 @@ export interface McpPathProbe {
    * never touches the host's real `PATH`.
    */
   findOnPath?: (name: string) => string | null;
+  /**
+   * Resolve a CDP-compatible local Chromium executable when launching locally
+   * without explicit `CHROME_DEVTOOLS_AXI_EXECUTABLE_PATH` or channel. Optional
+   * so unit-test probes that omit it never inspect host Chrome binaries.
+   */
+  detectCompatibleChromium?: () => string | null;
 }
 /**
  * The command and arguments for a stdio-launched chrome-devtools-mcp process.
@@ -868,8 +1135,7 @@ export interface SessionTerminatingTransport extends Transport {
 }
 
 export type ResolvedTransport =
-  | { kind: "http"; url: URL }
-  | { kind: "stdio"; spec: TransportSpec };
+  { kind: "http"; url: URL } | { kind: "stdio"; spec: TransportSpec };
 
 /**
  * A selected MCP transport plus the lifecycle operation that is unique to a
@@ -899,6 +1165,7 @@ const DEFAULT_MCP_PATH_PROBE: McpPathProbe = {
     }
   },
   findOnPath: (name) => findExecutableOnPath(name),
+  detectCompatibleChromium: () => detectCompatibleChromiumExecutable(),
 };
 
 function findExecutableOnPath(name: string): string | null {
@@ -1012,7 +1279,21 @@ export function resolveTransportSpec(
     };
   }
 
-  const mcpArgs = buildTransportArgs();
+  const autoConnect = process.env.CHROME_DEVTOOLS_AXI_AUTO_CONNECT === "1";
+  const browserUrl = process.env.CHROME_DEVTOOLS_AXI_BROWSER_URL;
+  const userDataDir = process.env.CHROME_DEVTOOLS_AXI_USER_DATA_DIR?.trim();
+  const channel = process.env.CHROME_DEVTOOLS_AXI_CHANNEL?.trim();
+  const explicitExecutablePath =
+    process.env.CHROME_DEVTOOLS_AXI_EXECUTABLE_PATH?.trim();
+  const defaultExecutablePath =
+    !autoConnect &&
+    !browserUrl &&
+    !userDataDir &&
+    !channel &&
+    !explicitExecutablePath
+      ? (probe.detectCompatibleChromium?.() ?? null)
+      : null;
+  const mcpArgs = buildTransportArgs({ defaultExecutablePath });
   if (!explicitPath) {
     const pathBinary = probe.findOnPath?.("chrome-devtools-mcp");
     if (pathBinary) {
@@ -1187,8 +1468,7 @@ export function createRootsAwareBridgeClient(client: Client): RootsAwareClient {
     confirmedRoots = null;
     currentRoots = next;
     let waiter:
-      | { resolve: () => void; reject: (error: unknown) => void }
-      | undefined;
+      { resolve: () => void; reject: (error: unknown) => void } | undefined;
     const fetched = new Promise<void>((resolve, reject) => {
       waiter = { resolve, reject };
       onRootsFetched = waiter;
